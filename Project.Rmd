@@ -1,0 +1,1292 @@
+---
+title: "STATS701 Project"
+author: "Jordan Farrer"
+date: '2016-11-14'
+output:
+  html_notebook:
+    code_folding: hide
+    css: style.css
+    number_sections: yes
+    theme: flatly
+    toc: yes
+    toc_float: yes
+---
+
+# Executive Summary
+
+Using a modified version of Virginia Commonwealth University's published dataset of diabetic hospitalization, we attempted to build a model to predict whether or not a patient would be readmitted within 30 days. Unfortunately, we were unable to build a prediction model that is better than simply guessing that patient would not be readmitted. In our analysis we try and tune logistic regression, classification tree, and random forest models. Our recommendation is that another dataset, perhaps including information the geography and hospital type, might produce more useful results. Unsurprisingly, the factor most associated with readmission within 30 days is number of inpatient visits in the year prior to the current hospitalization. The implication is that people who have needed care in the past will be the most likely to need care in the future - an expected finding.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = 'center', width = 100)
+```
+
+```{r setup2}
+set.seed(25)
+invisible(Sys.setlocale("LC_ALL", "en_US.UTF-8"))
+options(digits = 4, width = 220)
+
+logger <- function(msg, level = "info", file = log_file) {
+    cat(paste0("[", format(Sys.time(), "%Y-%m-%d %H:%M:%S.%OS"), "][", level, "] ", msg, "\n"), file = stdout())
+}
+
+base_dir <- ''
+data_dir <- paste0(base_dir, "data/")
+code_dir <- paste0(base_dir, "code/")
+viz_dir <- paste0(base_dir, "viz/")
+
+dir.create(data_dir, showWarnings = FALSE)
+dir.create(code_dir, showWarnings = FALSE)
+dir.create(viz_dir, showWarnings = FALSE)
+```
+
+```{r Load Packages, include = FALSE}
+# Create a function that will be used to load/install packages
+fn_load_packages <- function(p) {
+  if (!is.element(p, installed.packages()[,1]) || (p =="DT" && !(packageVersion(p) > "0.1"))) {
+    if (p == "DT") {
+      devtools::install_github('rstudio/DT')
+    } else {
+      install.packages(p, dep = TRUE, repos = 'http://cran.us.r-project.org')
+    }
+  }
+  a <- suppressPackageStartupMessages(require(p, character.only = TRUE))
+  if (a) {
+    logger(paste0("Loaded package ", p, " version ", packageVersion(p)))
+  } else {
+    logger(paste0("Unable to load packages ", p))
+  }
+}
+# Create a vector of packages
+packages <- c('tidyverse','ggthemes','knitr','extrafont','broom','glmnet','sparklyr',
+              'pander','descr','plotROC', 'ROCR','pROC','caret','stringr','readr','forcats',
+              'gridExtra','rpart','randomForest','scales','rattle')
+# Use function to load the required packages
+invisible(lapply(packages, fn_load_packages))
+```
+
+```{r Import Fonts}
+# To the font second font, run the following two lines of code and add name of user to vector
+# system(paste0("cp -r ",viz_dir,"fonts/. ~/Library/Fonts/")) # instantaneous
+# font_import() # takes approximately 5-10 min
+users_v <- c("Jordan")
+```
+
+```{r Create palette and theme}
+# Create a color palette
+pal538 <- ggthemes_data$fivethirtyeight
+
+# Create a theme to use throughout the analysis
+theme_jrf <- function(base_size = 8, base_family = ifelse(Sys.info()[['user']] %in% users_v, "DecimaMonoPro", "Helvetica")) {
+    theme(
+        plot.background = element_rect(fill = "#F0F0F0", colour = "#606063"), 
+        panel.background = element_rect(fill = "#F0F0F0", colour = NA), 
+        panel.border = element_blank(),
+        panel.grid.major =   element_line(colour = "#D7D7D8"),
+        panel.grid.minor =   element_line(colour = "#D7D7D8", size = 0.25),
+        panel.margin =       unit(0.25, "lines"),
+        panel.margin.x =     NULL,
+        panel.margin.y =     NULL,
+        axis.ticks.x = element_blank(), 
+        axis.ticks.y = element_blank(),
+        axis.title = element_text(colour = "#A0A0A3"),
+        axis.text.x = element_text(vjust = 1, colour = '#3C3C3C',
+                                   family = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica")),
+        axis.text.y = element_text(hjust = 1, colour = '#3C3C3C',
+                                    family = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica")),
+        legend.background = element_blank(),
+        legend.key = element_blank(), 
+        plot.title = element_text(face = 'bold', colour = '#3C3C3C', hjust = 0),
+        text = element_text(size = 9, family = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica")),
+        title = element_text(family = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica"))
+        
+    )
+}
+```
+
+```{r fn_plot_cv_glmnet}
+fn_plot_cv_glmnet <- function(cv_glmnet, main) {
+
+    data <- 
+        tidy(cv_glmnet) %>% as_tibble() %>%
+        mutate(log_lambda = log(lambda)) 
+    
+    data2 <-
+        data %>%
+        filter(row_number() %% 4 == 0)
+    
+    data3 <-
+        data_frame(
+            log_lambda = c(log(cv_glmnet$lambda.min), log(cv_glmnet$lambda.1se))
+            , name = c("Min", "1se")
+        )
+    
+    ggplot() +
+        geom_errorbar(data = data, aes(x = log_lambda, ymin = conf.low, ymax = conf.high), 
+                      colour = pal538['dkgray'][[1]], alpha = 0.6) +
+        geom_point(data = data, aes(x = log_lambda, y = estimate), colour = pal538['red'][[1]]) +
+        geom_vline(xintercept = log(cv_glmnet$lambda.min), colour = pal538['dkgray'][[1]], alpha = 0.6) +
+        geom_vline(xintercept = log(cv_glmnet$lambda.1se), colour = pal538['dkgray'][[1]], alpha = 0.6) + 
+        theme_jrf() +
+        labs(title = main, x = expression(log(lambda)), y = cv_glmnet$name) +
+        geom_text(data = data2, aes(x = log_lambda, y = Inf, label = nzero), vjust = 1, colour = '#3C3C3C',
+                  family = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica"),
+                  size = 2.25) +
+        geom_label(data = data3, aes(x = log_lambda, y = Inf, label = name), vjust = 5, colour = '#3C3C3C',
+                   family = ifelse(Sys.info()[['user']] %in% users_v,"DecimaMonoPro", "Helvetica"))
+}   
+```
+
+# Analysis
+
+## VCU Dataset
+
+```{r}
+original_raw <- read_csv(paste0(data_dir, "diabetic.data.csv"), na = c("", "NA","?"), progress = FALSE)
+vcu_data_raw <- read_csv(paste0(data_dir, "readmission.csv"), na = c("", "NA","?"), progress = FALSE)
+```
+
+The dataset is a modified version of the [Diabetes 130-US hospitals for years 1999-2008 Data Set ](https://archive.ics.uci.edu/ml/datasets/Diabetes+130-US+hospitals+for+years+1999-2008) provided by VCU (Virgina Commonwealth University) to the UCI Machine Learning Repository. This dataset was originally used in the paper [Impact of HbA1c Measurement on Hospital Readmission Rates: Analysis of 70,000 Clinical Database Patient Records](https://www.hindawi.com/journals/bmri/2014/781670/) that was consulted for this analysis. The modified dataset contains fewer features and modified columns. Noteably, the `medical_speciality` feature (i.e. speciality of the admitting physican of the patient) which was meaningful in the original authors' model is absent from the modified dataset, though it is rather sparse.
+
+Each record in the dataset represents a hospital admission (an encounter) in which diabetes was entered as a diagnosis of the the patient. Futhermore, this dataset is limited to hospital admissions that lasted 1-14 days, ones in which lab tests were performed, and some medications were administered. Implicitly, such encounters involve patients that visited hospitals using electronic healthcare managment systems.
+
+There are **`r prettyNum(nrow(vcu_data_raw), big.mark = ',')`** hospital admissions in the dataset and **`r ncol(vcu_data_raw)`** features, including the response of whether the patient was readmitted, an encounter ID, and a patient ID.
+
+### Data Integrity
+
+There are `r vcu_data_raw %>% filter(!complete.cases(.)) %>% nrow()` observations with missing values (`r round(vcu_data_raw %>% filter(!complete.cases(.)) %>% nrow() / vcu_data_raw %>% nrow() * 100,2)`% of the dataset) but all come from the `race` and `diag3mod` variables.
+
+```{r results = 'asis'}
+vcu_data_raw %>%
+    filter(!complete.cases(.)) %>%
+    summarise_each(funs(sum(is.na(.)))) %>%
+    gather(feature, `NA's`) %>%
+    arrange(desc(`NA's`)) %>%
+    filter(`NA's` != 0) %>%
+    pander(caption = "Features with Missing Values")
+```
+
+```{r}
+num_more_than_two <-
+    vcu_data_raw %>% 
+    group_by(patient_nbr) %>% 
+    filter(n() > 1) %>% 
+    distinct(patient_nbr) %>% 
+    nrow()
+
+percent_two <-
+    vcu_data_raw %>% 
+        group_by(patient_nbr) %>% 
+        filter(n() > 1) %>% 
+        count() %>% 
+        group_by(n) %>% 
+        count() %>% 
+        mutate(percent = 100* nn / sum(nn)) %>% 
+        filter(n == 2) %>% 
+        select(percent) %>% 
+        unlist()
+```
+
+There are **`r prettyNum(num_more_than_two, big.mark = ',')`** patients that have more than one hospitalization during the 10 year period, and **`r percent_two`%** have exactly two visits. There may be concerns about the observations being independent when we build a prediction model. However, we will keep the patients that have multiple visits in the period because they represent **`r 100* num_more_than_two / nrow(vcu_data_raw)`%** of the observations and significant information would otherwise be lost. We will not create a variable representing the number of visits during the 10 year people because this is not an intrinsic feature of the hospital visit.
+
+```{r}
+vcu_data_raw %>%
+    group_by(patient_nbr) %>%
+    filter(n() > 1) %>%
+    count() %>%
+    ggplot(aes(x = n, group = 1)) + 
+    geom_histogram(binwidth = 1, fill = pal538['blue'][[1]]) + 
+    theme_jrf() +
+    scale_y_continuous(labels = scales::comma) +
+    labs(title = "Hospitalizations (Patients with 2+ Visits in Period)", x = "# of Hospitalizations", y = "Number of Patients") +
+    geom_text(binwidth = 1, stat = "bin", aes(y = ..count.., 
+              label = ifelse(..count.. / sum(..count..) < 0.01, NA, scales::percent(..count.. / sum(..count..)))), 
+              position = position_dodge(width = 1), vjust = -0.5, family = "DecimaMonoPro", size = 2)
+    
+```
+
+Below are descriptions of the features in the dataset. We then summarise each type.
+
+|Num|Type|Feature|Description|
+|---|---|---|---|
+|1|Response|Readmitted|Whether or not the patient was readmitted to the hospital within 30 days of this visit|
+|2|Patient Demographics|Age|Age of patient in 4 categories (0-19, 20-59, 60-79, and 80+)|
+|3|Patient Demographics|Gender|Male or Femaile|
+|4|Patient Demographics|Race|African-American, Asian, Caucasian, Hispoanic, or Other|
+|5|Admission & Discharge Details|Admission Source|Who referred the patient for hospitalization (e.g. ER, Physican, Home Health)|
+|6|Admission & Discharge Details|Admission Type|Classification of admission (e.g. Elective, Emergenyc, Urgent, Other)|
+|7|Admission & Discharge Details|Discharge Disposition|Where was the patient discharged to (e.g. Home, Home with Service, SNF)|
+|8|Patient Medical History|Number Emergency Visits|Number of emergency visits by the patient in the year prior to current encounter|
+|9|Patient Medical History|Number Inpatient Visits|Number of inpatient visits by the patient in the year prior to current encounter|
+|10|Patient Medical History|Number Outpatient Visits|Number of outpatient visits by the patient in the year prior to current encounter|
+|11|Admission Details|Diagnosis Primary|Primary diagnosis (e.g. Circulatory, Respiratory, Digestive, Diabetes, Injury, etc.)|
+|12|Admission Details|Diagnosis Secondary|Secondary diagnosis (e.g. Circulatory, Respiratory, Digestive, Diabetes, Injury, etc.)|
+|13|Admission Details|Diagnosis Tertiary|Tertiary diagnosis (e.g. Circulatory, Respiratory, Digestive, Diabetes, Injury, etc.)|
+|14|Admission Information|Lab Procedures|Number of lab procedures performed during current encounter|
+|15|Admission Information|Medications|Number of medications prescribed during current encounter|
+|16|Admission Information|Producedures|Number of non-lab procedures performed during current encounter|
+|17|Admission Information|Diagnoses|Number of diagnoses entered during current encounter|
+|18|Admission Information|Times in Hospital|Length of stay in hospital (1-14 days)|
+|19|Clinical Tests|Diabetes Medication Change|Whether or not diabetes medication was changed during visit|
+|20|Clinical Tests|Diabetes Medication Prescribed|Whether or not diabetes medication was prescribed during visit|
+|21|Clinical Tests|HbA1c|Test that measures glucose control and is an indicator of perfomance of diabetes care|
+|22|Clinical Tests|Max Glucose Serum|Result of glucose serum test|
+|23|Clinical Tests|Metformin|Result of test (up, down, steady, or none performed)|
+|24|Clinical Tests|Glimepiride|Result of test (up, down, steady, or none performed)|
+|25|Clinical Tests|Glipizide|Result of test (up, down, steady, or none performed)|
+|26|Clinical Tests|Glyburide|Result of test (up, down, steady, or none performed)|
+|27|Clinical Tests|Pioglitazone|Result of test (up, down, steady, or none performed)|
+|28|Clinical Tests|Rosiglitazone|Result of test (up, down, steady, or none performed)|
+|29|Clinical Tests|Insulin|Result of test (up, down, steady, or none performed)|
+
+```{r}
+fn_icd9_code <- function(x) {
+    x <- ifelse(x == "Other" | str_detect(x, "V"), "Other", 
+            ifelse(str_detect(x, "250"), "Diabetes", 
+            ifelse((as.integer(x) >= 390 & as.integer(x) <= 459) | as.integer(x) == 785, "Circulatory", 
+            ifelse((as.integer(x) >= 460 & as.integer(x) <= 519) |as.integer(x) == 786, "Respiratory", 
+            ifelse((as.integer(x) >= 520 & as.integer(x) <= 579) | as.integer(x) == 787, "Digestive", 
+            ifelse((as.integer(x) >= 800 & as.integer(x) <= 999), "Injury",                    
+            ifelse((as.integer(x) >= 710 & as.integer(x) <= 739), "Musculoskeletal",    
+            ifelse((as.integer(x) >= 580 & as.integer(x) <= 629) | as.integer(x) == 788, "Genitourinary",             
+            ifelse((as.integer(x) >= 140 & as.integer(x) <= 239), "Neoplasms",  
+            "Other")))))))))
+    x <- factor(x, levels = c("Circulatory","Respiratory","Digestive","Diabetes","Injury","Musculoskeletal",
+                              "Genitourinary","Neoplasms","Other"))
+    return(x)
+}
+
+vcu_data_raw2 <- 
+    vcu_data_raw %>%
+    mutate_each_(funs(factor), names(sapply(., class)[sapply(., class) == "character"])) %>%
+    mutate(readmitted2 = readmitted) %>%
+    mutate(readmitted = as.factor(ifelse(readmitted == "<30", "Yes","No")))
+
+vcu_data <-
+    vcu_data_raw2 %>%
+    filter(complete.cases(.) & gender %in% c("Male","Female")) %>%
+    mutate(discharge = fct_recode(disch_disp_modified,
+                                  "Home" = "Discharged to home",
+                                  "SNF" = "Discharged/Transferred to SNF",
+                                  "Home with Service" = "Discharged to home with Home Health Service"
+    )) %>%
+    select(-disch_disp_modified, -readmitted2) %>%
+    mutate(change = fct_recode(change, "Yes" = "Ch")) %>%
+    mutate(
+        diag1 = fn_icd9_code(as.character(diag1_mod))
+        , diag2 = fn_icd9_code(as.character(diag2_mod))
+        , diag3 = fn_icd9_code(as.character(diag3_mod))
+        , metformin = factor(metformin, levels = c("Up","Down","Steady","No"))
+        , glimepiride = factor(glimepiride, levels = c("Up","Down","Steady","No"))
+        , glipizide = factor(glipizide, levels = c("Up","Down","Steady","No"))
+        , glyburide = factor(glyburide, levels = c("Up","Down","Steady","No"))
+        , pioglitazone = factor(pioglitazone, levels = c("Up","Down","Steady","No"))
+        , rosiglitazone = factor(rosiglitazone, levels = c("Up","Down","Steady","No"))
+        , insulin = factor(insulin, levels = c("Up","Down","Steady","No"))
+        , gender = factor(gender, levels = c("Male","Female"))
+    ) %>%
+    select(-diag1_mod, -diag2_mod, -diag3_mod) %>%
+    rename(
+        age = age_mod
+        , diabetes_medication_prescribed = diabetesMed
+        , diabetes_medication_change = change
+        , admission_type = adm_typ_mod
+        , admission_source = adm_src_mod
+        , HbA1C = A1Cresult
+        
+    ) %>%
+    mutate(admission_source = fct_recode(admission_source, "Home Health" = "Transfer from Home Health"))
+```
+
+### Data Summaries
+
+#### Readmission
+
+Readmission within 30 days is rather infrequent, happening on **`r 100 * vcu_data %>% group_by(readmitted) %>% count() %>% mutate(per = n / sum(n)) %>% filter(readmitted == "Yes") %>% select(per) %>% unlist()`%** percent of the encounters. This will make identification of this event difficult unless there are clear hallmarks of readmission.
+
+```{r}
+vcu_data %>%
+    ggplot(aes(x = readmitted, fill = readmitted)) + 
+    geom_bar() + 
+    theme_jrf() +
+    scale_fill_manual(values = c(pal538['red'][[1]], pal538['blue'][[1]])) +
+    labs(title = "Readmission within 30 days", x = "Readmitted within 30 days", y = "Number of Patients") +
+    scale_y_continuous(labels = scales::comma) +
+    guides(fill = FALSE) + 
+    geom_text(stat = "count", aes(y = ..count.., 
+            label = paste0(prettyNum(..count.., big.mark = ','), " (", scales::percent(..count.. / sum(..count..)),"%)")), 
+              position = position_dodge(width = 1), vjust = -0.5, family = "DecimaMonoPro", size = 2)
+```
+
+
+#### Patient Demographics
+
+```{r results = 'asis'}
+vcu_data %>%
+    select(race, age, gender) %>%
+    summary() %>% pander(missing = "", caption = "Feature Summary: Patient Demographics")
+```
+
+```{r}
+vcu_data %>%
+    select(race, age, gender, readmitted) %>%
+    gather(key, value, -readmitted) %>%
+    group_by(key, value, readmitted) %>%
+    count() %>%
+    group_by(key) %>%
+    mutate(n = n / sum(n)) %>%
+    ungroup() %>%
+    ggplot(aes(x = value, y = n, fill = readmitted)) +
+    geom_bar(stat = 'identity') +
+    facet_wrap(~key, scales = 'free', nrow = 2) +
+    scale_fill_manual("Readmitted", values = c('No' = pal538['blue'][[1]], 'Yes' = pal538['red'][[1]])) +
+    guides(fill = guide_legend(reverse = TRUE)) +
+    theme(legend.position = "top") + 
+    theme_jrf() +
+    labs(title = "Patient Demographics", x = NULL, y = NULL) +
+    scale_y_continuous(labels =  scales::percent)
+```
+
+
+#### Admission & Discharge Details
+
+```{r results = 'asis'}
+vcu_data %>%
+    select(admission_source, admission_type, discharge, readmitted) %>%
+    summary() %>% pander(missing = "", caption = "Feature Summary: Admission & Discharge Details")
+```
+
+```{r}
+vcu_data %>%
+    select(admission_source, admission_type, discharge, readmitted) %>%
+    gather(key, value, -readmitted) %>%
+    group_by(key, value, readmitted) %>%
+    count() %>%
+    group_by(key) %>%
+    mutate(n = n / sum(n)) %>%
+    ungroup() %>%
+    ggplot(aes(x = value, y = n, fill = readmitted)) +
+    geom_bar(stat = 'identity') +
+    facet_wrap(~key, scales = 'free', nrow = 2) +
+    scale_fill_manual("Readmitted", values = c('No' = pal538['blue'][[1]], 'Yes' = pal538['red'][[1]])) +
+    guides(fill = guide_legend(reverse = TRUE)) +
+    theme(legend.position = "top", axis.text.x = element_text(angle = 25, hjust = 1)) + 
+    theme_jrf() +
+    labs(title = "Admission & Discharge", x = NULL, y = NULL) +
+    scale_y_continuous(labels =  scales::percent)
+```
+
+
+#### Patient Medical History
+
+
+```{r results = 'asis'}
+vcu_data %>%
+    select(number_outpatient, number_inpatient, number_emergency) %>%
+    summary() %>% pander(missing = "", caption = "Feature Summary: Patient Medical History")
+```
+
+```{r}
+vcu_data %>%
+    select(number_outpatient, number_inpatient, number_emergency, readmitted) %>%
+    gather(key, value, -readmitted) %>%
+    group_by(key, value, readmitted) %>%
+    ungroup() %>%
+    ggplot(aes(x = value, fill = readmitted)) +
+    geom_histogram(binwidth = 1) +
+    facet_wrap(~ key, scales = 'free', nrow = 2) +
+    scale_fill_manual("Readmitted", values = c('No' = pal538['blue'][[1]], 'Yes' = pal538['red'][[1]])) +
+    guides(fill = guide_legend(reverse = TRUE)) +
+    theme(legend.position = "top") + 
+    theme_jrf() +
+    labs(title = "Patient Medical History", x = NULL, y = NULL) +
+    scale_y_continuous(labels =  scales::comma)
+    
+```
+
+```{r results = 'asis'}
+vcu_data %>%
+    select(number_outpatient, number_emergency, number_inpatient) %>%
+    summary() %>% pander(missing = "", caption = "Feature Summary: Patient Medical History")
+```
+
+```{r}
+vcu_data %>%
+    select(number_outpatient, number_emergency, number_inpatient, readmitted) %>%
+    gather(key, value, -readmitted) %>%
+    ggplot(aes(x = readmitted, y = value, fill = readmitted)) +
+    geom_boxplot(outlier.size = 1.5) +
+    facet_wrap(~ key, nrow = 1, drop = FALSE) +
+    scale_fill_manual("Readmitted", values = c('No' = pal538['blue'][[1]], 'Yes' = pal538['red'][[1]])) +
+    guides(fill = guide_legend(reverse = TRUE)) +
+    theme(legend.position = "top") + 
+    theme_jrf() +
+    labs(title = "Visits in Previous Year", x = NULL, y = NULL)
+
+```
+
+
+
+####Admission Details
+
+```{r results = 'asis'}
+vcu_data %>%
+    select(diag1, diag2, diag3) %>%
+    summary() %>% pander(missing = "", caption = "Feature Summary: Admission Details")
+```
+
+
+```{r}
+vcu_data %>%
+    select(diag1, diag2, diag3, readmitted) %>%
+    gather(key, value, -readmitted) %>%
+    group_by(key, value, readmitted) %>%
+    count() %>%
+    group_by(key) %>%
+    mutate(n = n / sum(n)) %>%
+    ungroup() %>%
+    mutate(value = factor(value, levels = levels(vcu_data$diag1))) %>%
+    ggplot(aes(x = value, y = n, fill = readmitted)) +
+    geom_bar(stat = 'identity') +
+    facet_wrap(~ key, scales = 'free', nrow = 2, drop = FALSE) +
+    scale_fill_manual("Readmitted", values = c('No' = pal538['blue'][[1]], 'Yes' = pal538['red'][[1]])) +
+    guides(fill = guide_legend(reverse = TRUE)) +
+    theme(legend.position = "top", axis.text.x = element_text(angle = 25, hjust = 1)) +
+    theme_jrf() +
+    labs(title = "Diagnoses", x = NULL, y = NULL) +
+    scale_y_continuous(labels =  scales::percent)
+    
+```
+
+```{r results = 'asis'}
+vcu_data %>%
+    select(time_in_hospital, number_diagnoses, num_lab_procedures, num_procedures, num_medications) %>%
+    summary() %>% pander(missing = "", caption = "Feature Summary: Admission Information")
+```
+
+```{r}
+vcu_data %>%
+    select(time_in_hospital, number_diagnoses, num_lab_procedures, num_procedures, num_medications, readmitted) %>%
+    gather(key, value, -readmitted) %>%
+    group_by(key, value, readmitted) %>%
+    ungroup() %>%
+    ggplot(aes(x = value, fill = readmitted)) +
+    geom_histogram(binwidth = 1) +
+    facet_wrap(~ key, scales = 'free', nrow = 2) +
+    scale_fill_manual("Readmitted", values = c('No' = pal538['blue'][[1]], 'Yes' = pal538['red'][[1]])) +
+    guides(fill = guide_legend(reverse = TRUE)) +
+    theme(legend.position = "top") + 
+    theme_jrf() +
+    labs(title = "Admission Information", x = NULL, y = NULL) +
+    scale_y_continuous(labels =  scales::comma)
+    
+```
+
+
+#### Clinical Results
+
+```{r results = 'asis'}
+vcu_data %>%
+    select(diabetes_medication_change, diabetes_medication_prescribed, HbA1C, max_glu_serum) %>%
+    summary() %>% pander(missing = "", caption = "Feature Summary: Diabetes Tests / Medication", split.table = Inf)
+```
+
+```{r}
+vcu_data %>%
+    select(HbA1C, max_glu_serum, diabetes_medication_change, diabetes_medication_prescribed, readmitted) %>%
+    gather(key, value, -readmitted) %>%
+    group_by(key, value, readmitted) %>%
+    count() %>%
+    group_by(key) %>%
+    mutate(n = n / sum(n)) %>%
+    ungroup() %>%
+    ggplot(aes(x = value, y = n, fill = readmitted)) +
+    geom_bar(stat = 'identity') +
+    facet_wrap(~ key, scales = 'free', nrow = 2) +
+    scale_fill_manual("Readmitted", values = c('No' = pal538['blue'][[1]], 'Yes' = pal538['red'][[1]])) +
+    guides(fill = guide_legend(reverse = TRUE)) +
+    theme(legend.position = "top") + 
+    theme_jrf() +
+    labs(title = "Diabetes Tests / Medication", x = NULL, y = NULL) +
+    scale_y_continuous(labels =  scales::percent)
+
+```
+
+
+```{r results = 'asis'}
+vcu_data %>%
+    select(glimepiride, glipizide, glyburide, insulin, metformin, pioglitazone, rosiglitazone) %>%
+    summary() %>% pander(missing = "", caption = "Feature Summary: Diabetes Tests / Medication")
+```
+
+```{r}
+vcu_data %>%
+    select(metformin, glimepiride, glipizide, glyburide, pioglitazone, rosiglitazone, insulin, readmitted) %>%
+    gather(key, value, -readmitted) %>%
+    group_by(key, value, readmitted) %>%
+    count() %>%
+    group_by(key) %>%
+    mutate(n = n / sum(n)) %>%
+    ungroup() %>%
+    mutate(value = factor(value, levels = levels(vcu_data$insulin))) %>%
+    ggplot(aes(x = value, y = n, fill = readmitted)) +
+    geom_bar(stat = 'identity') +
+    facet_wrap(~ key, scales = 'free', nrow = 2) +
+    scale_fill_manual("Readmitted", values = c('No' = pal538['blue'][[1]], 'Yes' = pal538['red'][[1]])) +
+    guides(fill = guide_legend(reverse = TRUE)) +
+    theme(legend.position = "top") + 
+    theme_jrf() +
+    labs(title = "Medication Change", x = NULL, y = NULL) +
+    scale_y_continuous(labels =  scales::percent)
+
+```
+
+## Feature Engineering
+
+### Medication Speciality
+
+Recognizing that the medical speciality of the admitting doctor might be important, we extract and tranform this feature form the original dataset. Unfortunately, there are many missing values.
+
+```{r}
+vcu <- 
+    vcu_data %>%
+    inner_join(
+        original_raw %>%
+            select(encounter_id, medical_specialty) %>%
+            mutate(
+                 ms1 = ifelse(is.na(medical_specialty), "Missing/Unknown", medical_specialty)
+                , ms1 = str_split_fixed(medical_specialty, "-", 2)[, 1]
+            ) %>%
+            group_by(ms1) %>%
+            mutate(n = as.numeric(n())) %>%
+            ungroup() %>%
+            mutate(freq = n / n()) %>%
+            mutate(
+                ms1 = ifelse(freq < 0.01 | ms1 == "", "Missing/Unknown", ms1)
+                #, medical_specialty = ifelse(is.na(medical_specialty), "Missing/Unknown", medical_specialty)
+                , medical_specialty = fct_infreq(ms1)
+            ) %>%
+            select(encounter_id, medical_specialty)
+        , by = c("encounter_id"= "encounter_id")
+    )
+
+
+vcu %>% 
+    group_by(medical_specialty, readmitted) %>% 
+    summarise(n = n()) %>%   # Within each Brand, sum all values in each Category
+    mutate(
+        percent = n / sum(n)
+        , pos = cumsum(n)-0.5*n) %>%
+    ggplot(aes(x = medical_specialty, y = n, fill = readmitted)) + 
+    geom_bar(stat = 'identity') + 
+    theme_jrf() +
+    scale_fill_manual("Readmitted", values = c('Yes' = pal538['red'][[1]], 'No' = pal538['blue'][[1]])) +
+    labs(title = "Medical Specialty", x = "", y = "Number of Patients") +
+    scale_y_continuous(labels = scales::comma) +
+    theme(legend.position = "top", axis.text.x = element_text(angle = 25, hjust = 1)) +
+    geom_text(aes(y = pos, label = scales::percent(percent)), family = "DecimaMonoPro", size = 2)
+```
+
+## Feature Selection
+
+```{r}
+n <- 12 # Number of times to run cv.glmnet with lasso
+```
+
+```{r eval = FALSE}
+fn_cv_glmnet <- function(data) {
+    x_matrix <- model.matrix(readmitted ~ . -patient_nbr -encounter_id, data = data)[, -1]
+    y <- data %>% select(readmitted) %>% unlist()
+    cv.glmnet(x_matrix, y, family = 'binomial', alpha = 1, nfolds = 10)
+}
+
+set.seed(1)
+glmnet_l <- list()
+glmnet_plot_l <- list()
+for (i in 1:n) {
+    p <- proc.time()
+    glmnet_l[[i]] <- fn_cv_glmnet(sample_frac(vcu, 0.5))
+    glmnet_plot_l[[i]] <- fn_plot_cv_glmnet(glmnet_l[[i]], paste0("Lasso Model ", i))
+    print(paste0("Run: ", i, " | Time: ", round((proc.time() - p)[3], 2)))
+}
+saveRDS(glmnet_l, paste0(data_dir, 'glmnet_l.RDS'))
+saveRDS(glmnet_plot_l, paste0(data_dir, 'glmnet_plot_l.RDS'))
+```
+
+Our method of feature selection is to create multiple 10-fold cross-validation for LASSO with sampled data. With the entire dataset, we sample 50% of the observations **`r n`** times and then perform 10-fold cross-validation for LASSO. We do this to avoid bias in using all the observations but also capture all the variation of the observations. Below are the `lambda.min` and `lambda.1se` for the 12 LASSO cross-validations.
+
+```{r results = 'asis'}
+glmnet_l <- readRDS(paste0(data_dir, 'glmnet_l.RDS'))
+glmnet_plot_l <- readRDS(paste0(data_dir, 'glmnet_plot_l.RDS'))
+
+bind_cols(data_frame(n = 1:n), bind_rows(lapply(glmnet_l, glance))) %>%
+    pander(caption = "Lambdas that minimize MSE and within 1 SE")
+```
+
+We then plot the 12 models and see the variation.
+
+```{r fig.width=8.5, fig.height=10}
+grid.arrange(grobs = glmnet_plot_l, nrow = 3)
+```
+
+We extract the coefficients associated with the model where lambda equals `lambda.1se` for the **`r n`** models and rank the instances of each.
+
+```{r}
+lasso_predictors_df <- data_frame()
+for (j in 1:length(glmnet_l)) {
+    lasso_predictors_df <- bind_rows(
+        lasso_predictors_df, 
+        coef(glmnet_l[[j]], s = glmnet_l[[j]]$lambda.1se) %>%
+            tidy() %>%
+            rename(var = row, coefficient = value) %>%
+            filter(var != "(Intercept)") %>%
+            mutate(run = j) %>%
+            select(var, coefficient, run)
+    )
+}
+
+lasso_predictors_df2 <- 
+    lasso_predictors_df %>%
+    mutate(var_name = str_extract(var, paste(names(vcu), collapse = '|'))) %>%
+    mutate(level = str_replace(var, var_name, "")) %>%
+    mutate(variable = ifelse(level == "", var_name, paste(var_name, level, sep = "\n"))) %>%
+    group_by(variable, var_name) %>%
+    count() %>%
+    ungroup() %>%
+    mutate(variable = fct_reorder(variable, n))
+
+lasso_predictors_df2 %>%
+    ggplot(aes(x = variable, y = n, fill = var_name)) +
+    geom_bar(stat = 'identity') +
+    coord_flip() +
+    theme_jrf() +
+    guides(fill = FALSE) +
+    labs(title = "Variables Selected by LASSO", y = paste0("Appearances in ",n," 10-fold LASSO Runs at lambda.1se", x = "")) +
+    scale_y_continuous(breaks = scales::pretty_breaks())
+```
+
+We see above that ther are **`r length(lasso_predictors_df2$variable)`** coefficients corresponding to **`r length(unique(lasso_predictors_df2$var_name))`** variables (listed below). We use these as the 
+
+```{r results = 'asis'}
+lasso_predictors_df3 <- 
+    lasso_predictors_df2 %>%
+        group_by(var_name) %>%
+        summarise(n = mean(n)) %>%
+        ungroup() %>%
+        arrange(desc(n)) %>%
+        mutate(n = row_number()) %>%
+        select(n, variable = var_name)
+#paste(lasso_predictors_df3$variable, collapse = " + ")
+
+lasso_predictors_df3 %>%
+    pander()
+```
+
+
+## Model Building
+
+### Basic
+
+```{r}
+inTrain <- createDataPartition(y = vcu$readmitted, p = .75, list = FALSE)
+vcu_train <- vcu[ inTrain,]
+vcu_test <- vcu[-inTrain,]
+```
+
+We create training dataset with 75% of the data and a test dataset with the remaining 25%.
+
+#### Backward Elimination
+
+We use the **`r length(unique(lasso_predictors_df2$var_name))`** variables identified by LASSO in a typical logistic regression model. We find that all features are significant at the 0.01 level except `time_in_hospital` which is removed. Below, is the Anova table showing the significance of each variable in the model with the training dataset.
+
+```{r results = 'asis'}
+fit1 <- glm(data = vcu_train, family = 'binomial', 
+            formula = readmitted ~ number_inpatient + number_diagnoses + discharge + time_in_hospital + 
+                diabetes_medication_prescribed + diag1 + num_medications + number_emergency + insulin + medical_specialty)
+fit2 <- glm(data = vcu_train, family = 'binomial', 
+            formula = readmitted ~  number_inpatient + number_diagnoses + discharge + diabetes_medication_prescribed +
+                 diag1 + num_medications + number_emergency + insulin + medical_specialty)
+
+car::Anova(fit2) %>%
+    tidy() %>%
+    pander(caption = "ANOVA for Logistic Regression Model by Backwards Elimination 2")
+```
+
+#### Classification Tree
+
+We produce a classification tree to see the which variables create the initial splits. Our process is to build a try with `cp = -1` and use the first value of `cp` that produces a non-root tree to grow a tree.
+
+```{r}
+inf_cp_tree <-
+    rpart::rpart(readmitted ~ number_inpatient + number_diagnoses + discharge + time_in_hospital + 
+                diabetes_medication_prescribed + diag1 + num_medications + number_emergency + insulin + medical_specialty, 
+                      data = vcu_train, control = rpart.control(cp = -1), method="class")
+
+fit3 <- rpart::rpart(readmitted ~ number_inpatient + number_diagnoses + discharge + time_in_hospital + 
+                diabetes_medication_prescribed + diag1 + num_medications + number_emergency + insulin + medical_specialty, 
+                      data = vcu_train, control = rpart.control(cp = inf_cp_tree$cptable[2, 1]), method="class")
+
+fancyRpartPlot(fit3, main = "Classification Tree", sub = "")
+```
+
+
+#### Random Forest
+
+Using the same variables from LASSO we produce a random forest using the defaults `mtry` and `ntree`. We see that the error rate quickly approaches an assympote by 200 trees. We used the function `tuneRF` to attempt to find the most appropriate `mtry` but found a single steo move up or down (mtry) did not improve OOB by 0.001.
+
+```{r eval = FALSE}
+rf_formula <- formula(
+                readmitted ~ number_inpatient + number_diagnoses + discharge + time_in_hospital + 
+                diabetes_medication_prescribed + diag1 + num_medications + number_emergency + insulin + medical_specialty
+)
+
+fit4 <- randomForest(rf_formula, data = vcu_train, ntree = 500)
+saveRDS(fit4, paste0(data_dir, "fit4.RDS"))
+```
+
+```{r}
+fit4 <- readRDS(paste0(data_dir, "fit4.RDS"))
+
+fit4$err.rate %>%
+    as_tibble() %>%
+    mutate(id = 1:n()) %>%
+    gather(Error, value, -id) %>%
+    mutate(Error = factor(Error, levels = c("OOB","Yes","No"))) %>%
+    ggplot(aes(x = id, y = value, colour = Error)) +
+    geom_line() +
+    theme_jrf() +
+    labs(title = "Random Forest Error Rate", x = "Trees", y = "Error Rate") +
+    scale_colour_manual(values = c(pal538[4:6] %>% unname()))
+```
+
+```{r eval = FALSE}
+fn_tune_mtry <- function(rf_formula, data, mtrys, n_per_mtry, ntree) {
+
+    df <- data_frame()
+    12
+    for (i in 1:mtrys) {
+        p <- proc.time()
+        oob_err <- replicate(n_per_mtry, tail(randomForest(rf_formula, data = data, mtry = i, ntree = ntree)$err.rate[,1],1))
+            
+        df <- bind_rows(df, data_frame(mtry = rep(i, n_per_mtry), oob_err = oob_err))
+        print(paste0("Run: ", i, " | Time: ", round((proc.time() - p)[3], 2)))
+    }
+    return(df)
+}
+tune_mtry_df <- fn_tune_mtry(rf_formula, data = vcu_train, mtrys = 10, n_per_mtry = 5, ntree = 200)
+saveRDS(tune_mtry_df, paste0(data_dir, "tune_mtry_df.RDS"))
+```
+
+Instead, we build a process to try a different `mtry` at each possible value of `mtry` five times. Interestingly, we find that the random forest with `mtry = 2` is always better than the default `mtry = 3`
+
+```{r}
+tune_mtry_df <- readRDS(paste0(data_dir, "tune_mtry_df.RDS"))
+
+tune_mtry_df %>%
+    ggplot() +
+    geom_point(aes(x = mtry, y = oob_err), alpha = 0.7, colour = pal538['blue'][[1]]) +
+    geom_line(data = . %>%
+                  group_by(mtry) %>%
+                  summarise(oob_err = mean(oob_err))
+              , aes(x = mtry, y = oob_err), colour = pal538['blue'][[1]]
+    ) + 
+    theme_jrf() +
+    scale_x_continuous(breaks = pretty_breaks(n = 10)) +
+    geom_point(data = . %>% 
+                  group_by(mtry) %>%
+                  summarise(oob_err = mean(oob_err)) %>%
+                  arrange(oob_err) %>%
+                  head(1)
+               , aes(x = mtry, y = oob_err), colour = pal538['red'][[1]]
+    ) + 
+    labs(title = "Tune mtry for Random Forest", y = 'OOB Error', x = 'mtry')
+```
+
+```{r eval = FALSE}
+fit5 <- randomForest(rf_formula, data = vcu_train, mtry = 2, ntree = 500)
+saveRDS(fit4, paste0(data_dir, "fit5.RDS"))
+```
+
+```{r}
+fit5 <- readRDS(paste0(data_dir, "fit5.RDS"))
+```
+
+#### Comparison
+
+```{r comparison fns}
+fn_auc_pr <- function(predictions, labels) {
+    pred <- prediction(predictions, labels)
+    perf <- performance(pred, "prec", "rec")
+    f <-
+        data_frame(
+              recall = unlist(perf@x.values) 
+            , precision = unlist(perf@y.values)
+        ) %>%
+        filter(complete.cases(.))
+         
+    auc <- caTools::trapz(f$recall, f$precision)
+    auc
+}
+
+fn_plot_df <- function(data, data_type) {
+    if (data_type == "Training") {
+        tmp_df <- 
+        data_frame(
+                `Backwards 1`   = fit1$fitted.values 
+                , `Backwards 2` = fit2$fitted.values
+                , rpart         = predict(fit3, type = "prob")[, 2]  
+                , `RF (mtry 2)` = predict(fit4, type = "prob")[, 2] 
+                , `RF (mtry 3)` = predict(fit5, type = "prob")[, 2]
+                )
+    } else {
+        tmp_df <- 
+        data_frame(
+                `Backwards 1`   = predict(fit1, data, type = "response")
+                , `Backwards 2` = predict(fit2, data, type = "response")
+                , rpart         = predict(fit3, data, type = "prob")[, 2]
+                , `RF (mtry 2)` = predict(fit4, data, type = "prob")[, 2]
+                , `RF (mtry 3)` = predict(fit5, data, type = "prob")[, 2]
+                )
+    }
+    
+    data %>% 
+        select(readmitted) %>%
+        bind_cols(tmp_df) %>%
+        gather(model, predictions, -readmitted) %>%
+        mutate(model = factor(model, 
+                              levels = c("Backwards 1","Backwards 2","rpart","RF (mtry 2)","RF (mtry 3)"))) %>%
+        mutate(readmitted = as.integer(readmitted) - 1)
+}
+
+fn_summary <- function(data) {
+    data %>%
+        mutate(
+            fail = ifelse(predictions != readmitted, 1, 0)
+            , response = ifelse(predictions > .5, 1, 0)
+            , fp = ifelse(readmitted == 0 & response == 1, 1, 0)
+            , fn = ifelse(readmitted == 1 & response == 0, 1, 0)
+        ) %>%
+        group_by(model) %>%
+        summarise(
+               MCE = paste0(round(100 * (sum(fp) + sum(fn)) / n(), 2), "%")
+            , `AUC ROC` = auc(roc(readmitted, predictions))[1]
+            , `AUC PR` = fn_auc_pr(predictions, readmitted)
+            ) %>%
+        mutate(
+             `MCE Rank` = dense_rank(`MCE`)
+            , `AUC ROC Rank` = dense_rank(desc(`AUC ROC`))
+            , `AUC PR Rank` = dense_rank(desc(`AUC PR`))
+        ) %>%
+        select(model,MCE,`MCE Rank`,`AUC ROC`,`AUC ROC Rank`,`AUC PR`,`AUC PR Rank`)
+}
+
+fn_roc_plot <- function(data, data_type) {
+    data %>%
+    ggplot(aes(d = readmitted, m = predictions, colour = model, linetype = model)) + 
+    geom_roc() + style_roc() + 
+    theme_jrf() +
+    labs(title = paste0("ROC for Basic Models - ",data_type," Data")) +
+    scale_colour_manual("Model", values = c('Backwards 2' = pal538['blue'][[1]], 'RF (mtry 2)' = pal538['red'][[1]],
+                                            'RF (mtry 3)' = pal538['red'][[1]],
+                                            'rpart' = pal538['green'][[1]], 'Backwards 1' = pal538['medgray'][[1]]
+                                            )) +
+    scale_linetype_manual(values = c(rep("solid", 4), rep("dashed", 1))) +
+    guides(linetype = FALSE)
+}
+
+fn_pr <- function(x, y, data) {
+    predictions <- data %>% select_(x)
+    labels <- data %>% select_(y)
+    pred <- prediction(predictions, labels)
+    perf <- performance(pred, "prec", "rec")
+    f <-
+        data_frame(
+              recall = unlist(perf@x.values) 
+            , precision = unlist(perf@y.values)
+        ) %>%
+        filter(complete.cases(.))
+    f
+}
+
+# Create the ROC PR Plot
+fn_pr_plot <- function(data, data_type) {
+    data %>%
+    group_by(model) %>%
+    nest() %>%
+    mutate(pr = purrr::map(data, ~ fn_pr('predictions', 'readmitted', data = .))) %>%
+    select(model, pr) %>%
+    unnest() %>%
+    ggplot(aes(x = recall, y = precision, colour = model, linetype = model)) + 
+    geom_line() + 
+    theme_jrf() +
+    labs(title = paste0("Precision vs Recall for Basic Models - ",data_type," Data"), x = "Recall", y = "Precision") +
+    scale_colour_manual("Model", values = c('Backwards 2' = pal538['blue'][[1]], 'RF (mtry 2)' = pal538['red'][[1]],
+                                            'RF (mtry 3)' = pal538['red'][[1]],
+                                            'rpart' = pal538['green'][[1]], 'Backwards 1' = pal538['medgray'][[1]]
+                                            )) +
+    scale_linetype_manual(values = c(rep("solid", 4), rep("dashed", 1))) +
+    guides(linetype = FALSE)
+}
+```
+
+We compare the models we have build by looking at the in-sample misclassification error rate (MSE) and the AUC for the ROC Curve. Unfortunately, none of these models is much better than the trival model (predict that the patient will not be readmitted within 30 days). At issue is the fact that we have an imbalanced response, so based on the paper [The Precision-Recall Plot Is More Informative than the ROC Plot When Evaluating Binary Classifiers on Imbalanced Datasets](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4349800/), we build Precision-Recall plots and calculate AUC for PR (Precision Recall) plots. We know from this [paper](http://pages.cs.wisc.edu/~jdavis/davisgoadrichcamera2.pdf) that the model that dominates in the ROC space will dominate in the PR space. In our case, this model is the random forest model.
+
+```{r results = 'asis'}
+plot_df_train <- fn_plot_df(vcu_train, "Training")
+train_summary <- fn_summary(plot_df_train)
+
+train_summary %>%
+    pander(caption = "Model Comparison - Training Data")
+```
+
+We explore the ROC curve for the four models.
+
+```{r}
+fn_roc_plot(plot_df_train, "Training")
+```
+
+Below is the Precision-Recall curves for each of the four models.
+
+```{r}
+fn_pr_plot(plot_df_train, "Training")
+```
+
+#### Testing Data
+
+We select to use the second logistic regression model as our final model, but check all of the models against the testing data anyway.
+
+```{r results = 'asis'}
+plot_df_test <- fn_plot_df(vcu_test, "Testing")
+test_summary <- fn_summary(plot_df_test)
+
+test_summary %>%
+    pander(caption = "Model Comparison - Testing Data")
+```
+
+We find that the logistic regression models perform quite well with this dataset.
+
+```{r}
+fn_roc_plot(plot_df_test, "Testing")
+```
+
+```{r}
+fn_pr_plot(plot_df_test, "Testing")
+```
+
+#### Variable Importance
+
+Using our chosen model, we can rank the important characteristics by looking at the absolute value of the $z$-value. We pick out the top 10:
+
+```{r}
+tidy(fit2) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(imp = abs(statistic)) %>%
+    select(term, imp) %>%
+    mutate(var_name = str_extract(term, paste(names(vcu), collapse = '|'))) %>%
+    mutate(level = str_replace(term, var_name, "")) %>%
+    mutate(variable = ifelse(level == "", var_name, paste(var_name, level, sep = "\n"))) %>%
+    mutate(variable = fct_reorder(variable, imp)) %>%
+    arrange(desc(imp)) %>%
+    head(10) %>%
+    ggplot(aes(x = variable, y = imp, fill = var_name)) +
+    geom_bar(stat = 'identity') +
+    theme_jrf() +
+    coord_flip() +
+    labs(x = "Variable", y = "Importance", title = "10 Most Important Factors Determining Readmission")
+```
+
+The chart below shows at each number of inpatient visits in the prior, the percent of patients that will be readmitted within 30 days of their current hospitalization. Unsurprisingly, we see that as the number of inpatient visits in the prior year increase, so does the percent of patients that are readmitted.
+
+```{r}
+vcu_train %>% 
+    group_by(number_inpatient, readmitted) %>% 
+    summarise(n = n()) %>%   
+    mutate(
+        percent = n / sum(n)
+        , pos = cumsum(percent)-0.5*percent) %>%
+    ggplot(aes(x = number_inpatient, y = percent, fill = readmitted)) + 
+    geom_bar(stat = 'identity') + 
+    theme_jrf() +
+    scale_fill_manual("Readmitted", values = c('Yes' = pal538['red'][[1]], 'No' = pal538['blue'][[1]])) +
+    labs(title = "Number of Inpatient Visits in Prior Year", x = "", y = "% of Patients") +
+    scale_y_continuous(labels = scales::percent) +
+    theme(legend.position = "top") +
+    geom_text(aes(y = pos, label = scales::percent(percent)), family = "DecimaMonoPro", size = 2)
+```
+
+
+### Spark
+
+We will use [Spark MLlib](http://spark.apache.org/docs/latest/ml-guide.html) and Rstudio's new [sparklyr](http://spark.rstudio.com/) package to test a number of different classificaiton models to identify whether or not a patient will be readmitted. This is done to get experience using Spark. The analysis and code is adapted from this [guide](https://beta.rstudioconnect.com/content/1518/notebook-classification.html) created by Rstudio.
+
+#### Train Models
+
+After installing and copying out VCU dataset into Spark, we partition the dataset into test and training data. We create a model formula that was based off our [LASSO feature selection process](#23_feature_selection). We then fit 5 different models and compare the results.
+
+```{r}
+if (!(c("2.0.0") %in% spark_installed_versions()$spark)) {spark_install(version = "2.0.0")}
+
+sc <- spark_connect(master = "local", version = "2.0.0")
+vcu_tbl <- copy_to(sc, vcu)
+
+partition <- 
+    vcu_tbl %>% 
+    select(-patient_nbr, -encounter_id) %>%
+    mutate(readmitted = as.numeric(ifelse(readmitted == "Yes",1,0))) %>%
+    sdf_partition(train = 0.75, test = 0.25, seed = 1243)
+
+train_tbl <- partition$train
+test_tbl <- partition$test
+
+ml_formula <- formula(readmitted ~ number_inpatient + number_diagnoses + discharge + time_in_hospital + 
+                diabetes_medication_prescribed + diag1 + num_medications + number_emergency + insulin + medical_specialty)
+
+
+ml_log <- ml_logistic_regression(train_tbl, ml_formula)
+ml_dt <- ml_decision_tree(train_tbl, ml_formula)
+ml_rf <- ml_random_forest(train_tbl, ml_formula)
+ml_gbt <- ml_gradient_boosted_trees(train_tbl, ml_formula)
+ml_nb <- ml_naive_bayes(train_tbl, ml_formula)
+
+ml_models <- list(
+  "Logistic" = ml_log,
+  "Decision Tree" = ml_dt,
+  "Random Forest" = ml_rf,
+  "Gradient Boosted Trees" = ml_gbt,
+  "Naive Bayes" = ml_nb
+)
+```
+
+#### Performance Metrics
+  
+We start off my examining the lift of each model.
+
+```{r}
+score_test_data <- function(model, data = test_tbl){
+  pred <- sdf_predict(model, data)
+  select(pred, readmitted, prediction)
+}
+
+ml_score <- lapply(ml_models, score_test_data)
+
+calculate_lift <- function(scored_data) {
+  scored_data %>%
+    mutate(bin = ntile(desc(prediction), 10)) %>% 
+    group_by(bin) %>% 
+    summarize(count = sum(readmitted)) %>% 
+    mutate(prop = count / sum(count)) %>% 
+    arrange(bin) %>% 
+    mutate(prop = cumsum(prop)) %>% 
+    select(-count) %>% 
+    collect() %>% 
+    as.data.frame()
+}
+
+ml_gains <- data.frame(bin = 1:10, prop = seq(0, 1, len = 10), model = "Base")
+
+for(i in names(ml_score)){
+  ml_gains <- ml_score[[i]] %>%
+    calculate_lift %>%
+    mutate(model = i) %>%
+    rbind(ml_gains, .)
+}
+
+ml_gains %>%
+    ggplot(aes(x = bin, y = prop, colour = model)) +
+    geom_point() + geom_line() +
+    labs(title = "Lift Chart for Predicting Readmission - Test Data Set", x= "Decile", y = "") + 
+    theme_jrf() +
+    scale_x_continuous(breaks = 0:10)
+```
+
+Next, we'll examine the five models' MCE and AUC (ROC and PR curves). We see that these metrics are nearly the same as the models use basic R.
+
+```{r results = 'asis'}
+calc_accuracy <- function(data, cutpoint = 0.5){
+  1 - 
+  data %>% 
+    mutate(prediction = if_else(prediction > cutpoint, 1.0, 0.0)) %>%
+    mutate(readmitted = as.numeric(readmitted)) %>%
+    ml_classification_eval("prediction", "readmitted", "accuracy")
+}
+
+perf_metrics <- 
+    data_frame(
+        model = names(ml_score)
+        , `MCE` = sapply(ml_score, calc_accuracy) %>% unlist()
+        , `AUC ROC` = sapply(ml_score, ml_binary_classification_eval, "readmitted", "prediction") %>% unlist()
+        , `AUC PR` = sapply(ml_score, ml_binary_classification_eval, "readmitted", "prediction", "areaUnderPR") %>% unlist()
+    )
+
+perf_metrics %>%
+    pander(caption = "Comparison of 5 Spark Models")
+```
+
+```{r}
+perf_metrics %>%
+    gather(metric, value, -model) %>%
+    ggplot(aes(reorder(model, value), value, fill = metric)) + 
+    geom_bar(stat = "identity", position = "dodge") + 
+    coord_flip() +
+    labs(title = "Performance Metrics", x = "", y = "") +
+    theme_jrf() +
+    scale_y_continuous(label = scales::percent) +
+    scale_fill_manual("Metric", values = c("AUC ROC" = pal538['green'][[1]], "AUC PR" = pal538['blue'][[1]], 
+                                           "MCE" = pal538['red'][[1]]))
+```
+
+#### Feature Importance
+
+We can also look at feature importance (despite Professor Zhao's preference against this approach). Like in the traditional approaches, we see that the number of inpatient visits in the previous year is the strongest predictor of readmission within 30 days.
+
+```{r fig.height= 8, fig.width= 8}
+feature_importance <- data.frame()
+
+for(i in c("Decision Tree", "Random Forest", "Gradient Boosted Trees")){
+  feature_importance <- ml_tree_feature_importance(sc, ml_models[[i]]) %>%
+    mutate(Model = i) %>%
+    mutate(importance = as.numeric(levels(importance))[importance]) %>%
+    mutate(feature = as.character(feature)) %>%
+    rbind(feature_importance, .)
+}
+
+feature_importance %>%
+    ggplot(aes(reorder(feature, importance), importance, fill = Model)) + 
+    facet_wrap(~Model) +
+    geom_bar(stat = "identity") + 
+    coord_flip() +
+    labs(title = "Feature Importance", x="", y = "Importance") +
+    theme_jrf() +
+    scale_fill_manual(values = c(pal538[4:6] %>% unname()))
+    
+```
+
+#### Runtimes
+
+Finally we review the runtimes each model, which could be important if we were to scale this process.
+
+```{r}
+n_runtime <- 10
+```
+
+```{r eval = FALSE}
+format_as_character <- function(x){
+  x <- paste(deparse(x), collapse = "")
+  x <- gsub("\\s+", " ", paste(x, collapse = ""))
+  x
+}
+
+format_statements <- function(y){
+  y <- format_as_character(y[[".call"]])
+  y <- gsub('ml_formula', ml_formula_char, y)
+  y <- paste0("system.time(", y, ")")
+  y
+}
+
+ml_formula_char <- format_as_character(ml_formula)
+
+all_statements <- sapply(ml_models, format_statements) %>%
+  rep(., n_runtime) %>%
+  parse(text = .)
+
+res  <- map(all_statements, eval)
+saveRDS(res, paste0(data_dir, "res.RDS"))
+```
+
+```{r}
+res <- readRDS(paste0(data_dir, "res.RDS"))
+result <- data.frame(model = rep(names(ml_models), n_runtime),
+                     time = sapply(res, function(x){as.numeric(x["elapsed"])})) 
+
+result %>% 
+    ggplot(aes(time, reorder(model, time))) + 
+    geom_boxplot() + 
+    geom_jitter(width = 0.4, aes(colour = model)) +
+    scale_colour_discrete(guide = FALSE) +
+    labs(title = "Model Training Runtimes", x = "Seconds", y = "") +
+    theme_jrf()
+```
+
+### Model Comparison
+
+```{r results = 'asis'}
+links <- c("[ml_logistic_regression](http://spark.rstudio.com/reference/sparklyr/latest/ml_logistic_regression.html)",
+           "[ml_decision_tree](http://spark.rstudio.com/reference/sparklyr/latest/ml_decision_tree.html)",
+           "[ml_random_forest](http://spark.rstudio.com/reference/sparklyr/latest/ml_random_forest.html)",
+           "[ml_gradient_boosted_trees](http://spark.rstudio.com/reference/sparklyr/latest/ml_gradient_boosted_trees.html)",
+           "[ml_naive_bayes](http://spark.rstudio.com/reference/sparklyr/latest/ml_naive_bayes.html)"
+           )
+
+perf_metrics %>%
+    bind_cols(data_frame(Function = links)) %>%
+    inner_join(
+        result %>%
+            group_by(model) %>%
+            summarise(run_time = mean(time))
+        , by = c('model'='model')
+    ) %>%
+    mutate(
+        `AUC ROC Rank` = dense_rank(desc(`AUC ROC`))
+        , `AUC PR Rank` = dense_rank(desc(`AUC PR`))
+        , `MCE Rank` = dense_rank(MCE)
+        , `Runtime Rank` = dense_rank(run_time)
+    ) %>%
+    arrange(`AUC ROC Rank`) %>%
+    mutate(Num = row_number()) %>%
+    select(Num, Model = model, Function, `AUC ROC Rank`, `AUC PR Rank`, `MCE Rank`, `Runtime Rank`) %>%
+    pander(split.table = Inf)
+```
+
+
+## Final Model
+
+The final model is a logistic regression model because all the model had the same performance and logistic regression is the most explainable. The final model includes the following features:
+
+|Num|Type|Feature|Description|
+|---|---|---|---|
+|1|Patient Medical History|Number Inpatient Visits|Number of inpatient visits by the patient in the year prior to current encounter|
+|2|Admission Information|Diagnoses|Number of diagnoses entered during current encounter|
+|3|Admission & Discharge Details|Discharge Disposition|Where was the patient discharged to (e.g. Home, Home with Service, SNF)|
+|4|Clinical Tests|Diabetes Medication Prescribed|Whether or not diabetes medication was prescribed during visit|
+|5|Admission Details|Diagnosis Primary|Primary diagnosis (e.g. Circulatory, Respiratory, Digestive, Diabetes, Injury, etc.)|
+|6|Admission Information|Medications|Number of medications prescribed during current encounter|
+|7|Patient Medical History|Number Emergency Visits|Number of emergency visits by the patient in the year prior to current encounter|
+|8|Clinical Tests|Insulin|Result of test (up, down, steady, or none performed)|
+|9|Admission & Discharge Details|Medical Speciality|Medical speciality of the admitting physican (mostly Other)|
+
+We use the test dataset to find the MCE.
+
+```{r results = 'asis'}
+test_confusion <-
+    vcu_test %>%
+        select(readmitted) %>%
+        mutate(pred = ifelse(predict(fit2, vcu_test, type = 'response') > 0.5, "Yes", "No"))
+
+final_model_mce <- round(100* test_confusion %>% summarise(mce = sum(readmitted != pred) / n()) %>% unlist(),2)
+ppv <- round(100* test_confusion %>% summarise(mce = sum(readmitted != pred & readmitted == "Yes") / n()) %>% unlist(), 2)
+trival_model_mce <- round(100* test_confusion %>% summarise(mce = sum(readmitted != "No") / n()) %>% unlist(),2)
+
+
+pander(descr::CrossTable(test_confusion$readmitted, test_confusion$pred, prop.chisq=FALSE, prop.r = F, prop.c = F, prop.t = TRUE, chisq = TRUE, dnn = c("Readmitted","Prediction")), split.table = Inf, big.mark = ',')
+```
+
+We see that the MCE is **`r final_model_mce`%**. However, what we see is that the model is good at predicting when a patient will not be readmitted within 30 day but has difficulty properly predicting a true positive (positive prediction value = $\frac{TP}{TP+FP}$=`r ppv`)
+
+## Conclusion
+
+We have been unable to build classification model using the modified VCU dataset that is significantly better than trivial model (predict all patients will not be readmitted). Our final models misclassificiation error is approximately `r final_model_mce`% on our test dataset (25% of VCU dataset) whereas the trivial model MCE is **`r trival_model_mce`%** on the same test dataset.
+
+There are 3 possible takeways
+
+1. We did not modify the features in a propor manner to predict readmission within 30 days
+2. This analysis did not contain the necessary predictors (i.e. there are differences across the country and by hospital type or compnay)
+3. Readmission within 30 days is completely random with $P(readmission) \approx .11$
+
+We believe that item (2) above to be the most likely and additional data collection and analysis would be required.
+
+### Limitiations
+
+Below we outline some addition limitations:
+
+1. Diabetic encounters are not all encounters of diabetes patients, but rather only these where diabetes was coded as an existing health condition (from the [original paper](https://www.hindawi.com/journals/bmri/2014/781670/))
+2. This dataset only included data from hospitals that were using electronic medicial records systems during the years 1999-2008 during an era before [HITECH Act of 2009](https://www.hhs.gov/hipaa/for-professionals/special-topics/HITECH-act-enforcement-interim-final-rule/) (Health Information Technology for Economic and Clinical Health) which promoted the adoption and use of health information technology.
